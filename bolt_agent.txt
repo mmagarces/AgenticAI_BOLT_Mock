@@ -1,0 +1,603 @@
+"""
+BOLT Agentic AI Controller - Enhanced Agent Implementation
+This module implements an enhanced AI agent for controlling the BOLT beamline
+with file viewing capabilities.
+"""
+
+import os, subprocess, time, glob, traceback
+from datetime import datetime
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_community.llms import Ollama
+from langchain_ollama import OllamaLLM
+from bluesky import RunEngine
+import bluesky.plan_stubs as bps
+import open3d as o3d
+import streamlit as st
+
+RE = RunEngine({})  # already available
+
+# Import our fixed mock implementation
+from mock_bolt import connect_to_mock_bolt
+from bolt_hardware import motor, camera, acquire_signal, callbacks_signal
+
+#Define python env
+env = "python"
+
+def convert_image_format(input_image_file: str, output_image_file: str):
+    with Image.open(input_image_file) as im:
+        im.save(output_image_file, format="PNG")
+
+    return output_image_file
+
+class EnhancedBoltAgent:
+    """Enhanced AI Agent for controlling BOLT beamline with file viewing capabilities."""
+    
+    def __init__(self, ws_url=None, 
+                 ollama_model="llama3", ollama_url="http://localhost:11434"):
+        """Initialize the agent with connection to BOLT."""
+        # Use our fixed mock implementation directly
+        #self.sample_stage, self.detector = connect_to_mock_bolt()
+        self.data_dir = "tomography_data"
+        os.makedirs(self.data_dir, exist_ok=True)
+        
+        # Initialize the projection files list
+        self.projection_files = []
+        
+        # Keep track of displayed files for reference
+        self.displayed_files = {}
+        self.last_reconstruction = None
+        
+        # Initialize the LLM
+        self.ollama_model = ollama_model
+        self.ollama_url = ollama_url
+        self.llm = OllamaLLM(model=self.ollama_model, base_url=self.ollama_url)
+        
+        # Setup the prompt
+        prompt_template = """
+        You are an AI assistant controlling a BOLT beamline for tomography experiments.
+        You interact with the user to collect data and perform reconstructions.
+        
+        Your capabilities:
+        1. Move the sample stage to specific rotation angles
+        2. Take measurements at different angles
+        3. Run tomography scans over a range of angles
+        4. Reconstruct 3D volumes from projection data
+        5. Get information about the current setup
+        6. Display specific files that have been created
+        7. Display lists that I provide for you in a neat manner
+
+        User's request: {user_input}
+        Action result: {action_result}
+        
+        Provide a helpful response explaining what was done. If there was an error, suggest how to fix it.
+        Keep your response concise and informative.
+        """
+        
+        self.prompt = PromptTemplate(
+            input_variables=["user_input", "action_result"],
+            template=prompt_template
+        )
+        
+        self.llm_chain = self.prompt | self.llm  # RunnableSequence
+
+    def process_input(self, user_input):
+        """Process user input by detecting commands and executing them."""
+        try:
+            # Normalize the input
+            user_input_lower = user_input.lower().strip()
+            action_result = "No action taken. Please specify what you'd like to do."
+            
+            # Check for file display/show command
+            if any(cmd in user_input_lower for cmd in ["show", "display", "view", "see", "list"]):
+                if "reconstruction" in user_input_lower:
+                    import re
+                    words = re.findall(r'\b\w+\b', user_input)
+                    action_result = self.show_reconstruction(words[-1])
+                
+                elif "projection" in user_input_lower or "npy" in user_input_lower or "measurement" in user_input_lower:
+                    # Try to find which projection they want to see
+                    import re
+                    # Look for numbers in the request
+                    angle_match = re.search(r'(\d+\.?\d*)', user_input)
+                    
+                    if angle_match:
+                        # They specified an angle
+                        angle = float(angle_match.group(1))
+                        action_result = self.show_projection_at_angle(angle)
+                    elif "last" in user_input_lower or "recent" in user_input_lower or "latest" in user_input_lower:
+                        # They want the most recent projection
+                        action_result = self.show_last_projection()
+                    else:
+                        # Show all projections
+                        action_result = self.list_available_files()
+                
+                elif "file" in user_input_lower and ("list" in user_input_lower or "available" in user_input_lower):
+                    if ("files" in user_input_lower):
+                        action_result = self.list_available_files()
+                
+                elif "folder" in user_input_lower and ("list" in user_input_lower or "available" in user_input_lower):
+                    if ("folders" in user_input_lower):
+                            action_result = self.list_available_folders()
+
+                elif "show" in user_input_lower and "file" in user_input_lower:
+                    # Try to extract a filename
+                    input = user_input.split()
+                    action_result = self.show_file(input[-1])
+            
+            # Check for move command
+            elif any(cmd in user_input_lower for cmd in ["move to", "rotate to", "go to"]):
+                # Extract angle
+                import re
+                angle_match = re.search(r'(\d+\.?\d*)', user_input)
+                if angle_match:
+                    angle = float(angle_match.group(1))
+                    action_result = self.move_rotation(angle)
+
+            #Check for move by command
+            elif any(cmd in user_input_lower for cmd in ["rotate by", "move by"]):
+                # Extract angle
+                import re
+                angle_match = re.search(r'(\d+\.?\d*)', user_input)
+                if angle_match:
+                    angle = float(angle_match.group(1))
+                    action_result = self.move_rotation_by(angle)
+            
+            # Check for measurement command
+            elif any(cmd in user_input_lower for cmd in ["take a measurement", "measure", "take measurement", "capture data"]):
+                action_result = self.take_measurement()
+            
+            # Check for tomography scan command
+            elif any(cmd in user_input_lower for cmd in ["tomography scan", "run scan", "perform scan"]):
+                # Extract parameters
+                import re
+                numbers = re.findall(r'(\d+\.?\d*)', user_input)
+                words = re.findall(r'\b\w+\b', user_input)        
+
+                #One full rotation being 128 and maximum rotation angle being 360 (If we limit it)
+                ratio = 128 / 360
+
+                if len(numbers) >= 3 and words[-1] != "projections":
+                    start_angle = float(numbers[0])  * ratio
+                    end_angle = float(numbers[1]) * ratio
+                    num_projections = int(float(numbers[2]))
+                    save_dir = words[-1]
+                elif len(numbers) >= 3:
+                    start_angle = float(numbers[0]) * ratio
+                    end_angle = float(numbers[1]) * ratio
+                    num_projections = int(float(numbers[2]))
+                    save_dir = "default"
+                elif len(numbers) == 2:
+                    start_angle = float(numbers[0])  * ratio
+                    end_angle = float(numbers[1])  * ratio
+                    num_projections = 10  # Default
+                    save_dir = "default"  # Default
+                elif len(numbers) == 1:
+                    start_angle = 0  # Default
+                    end_angle = 128  # Default
+                    num_projections = int(float(numbers[0]))
+                    save_dir = "default" # Default
+                else:
+                    start_angle = 0  # Default
+                    end_angle = 128  # Default
+                    num_projections = 10  # Default
+                    save_dir = "default" # Default
+                
+                action_result = self.run_tomography_scan(start_angle, end_angle, num_projections, save_dir)
+            
+            # Check for reconstruction command
+            elif any(cmd in user_input_lower for cmd in ["reconstruct", "create 3d", "reconstruction"]):
+                import re
+                words = re.findall(r'\b\w+\b', user_input)   
+                folder_name = words[-1]     
+                
+                action_result = self.reconstruct_data(folder_name)
+            
+            # Check for current angle command
+            elif any(cmd in user_input_lower for cmd in ["current angle", "what angle", "what is the angle"]):
+                action_result = self.get_current_angle()
+            
+            # Check for dataset info command
+            elif any(cmd in user_input_lower for cmd in ["dataset info", "data info", "about the dataset"]):
+                import re
+                words = re.findall(r'\b\w+\b', user_input)   
+                folder_name = words[-1]     
+                action_result = self.get_dataset_info(folder_name)
+                
+            # Get a friendly response from the LLM
+            response = self.llm_chain.invoke({"user_input": user_input, "action_result": action_result})
+            return response
+            
+        except Exception as e:
+            print(f"Error processing command: {e}")
+            print(traceback.format_exc())
+            return f"I encountered an error while processing your request: {str(e)}"
+        
+    #Done (Dependency on streamlit) (Can be done)
+    def get_dataset_info(self, folder):
+        """Get information about the current dataset."""
+        try:
+            #Check if files exist from the scan
+            path = "/home/user/tmpData/AI_scan/" + folder +"/images_png/"
+            print(path)
+            if os.path.isdir(path):
+                print(f"Folder exists, gathering data from {folder}")
+
+                files = os.listdir(path)
+                angles = []
+                for i in range (len(files)):
+                    split = files[i].split("_")
+                    angles.append(float(split[7]))      #Make sure to convert name of file to a float format
+
+                ###Added angles to file names generated from runnnig tomograpgy scans, make sure they match with results from take measurement.
+                return f"Dataset contains {len(files)} projections with angles ranging from {min(angles):.2f} to {max(angles):.2f} degrees"
+            else:
+                raise FileNotFoundError(f"Folder not found: {path}")
+            
+        except Exception as e:
+            print(f"Error finding dataset: {e}")
+            print(traceback.format_exc())
+            return f"Error reconstructing dataset: {str(e)}"
+
+    #Done (Dependency on streamlit)  (Can be done)
+    def get_dataset_file_info(self, folder):
+        """Get information about the current dataset."""
+        try:
+            #Check if files exist from the scan
+            path = "/home/user/tmpData/AI_scan/" + folder +"/images_png/"
+            if os.path.isdir(path):
+                print(f"Folder exists, gathering data from {folder}")
+
+                files = os.listdir(path)
+                output = []
+                for i in range (len(files)):
+                    output.append(path + files[i])      #Make sure to convert name of file to a float format
+                return output
+            
+            else:
+                raise FileNotFoundError(f"Folder not found: {path}")
+            
+        except Exception as e:
+            print(f"Error finding dataset: {e}")
+            print(traceback.format_exc())
+            return f"Error reconstructing dataset: {str(e)}"
+    
+    #Needs fixing with the st.write  (Can be done)
+    def list_available_files(self):
+        """Ideally I'd like to potential data sets that I have, so folders with data and such."""
+        try:
+            path = "/home/user/tmpData/AI_scan/"
+            folders = os.listdir(path)
+            for i in range(len(folders)):
+                if (folders[i] != "measurements" and folders[i] != "testing"):
+                    dataset_info = self.get_dataset_file_info(folders[i])
+                    dataset_info.sort()
+                    st.write(folders[i])
+                    for i in range(len(dataset_info)):
+                        st.write(dataset_info[i])
+
+            return dataset_info
+        except Exception as e:
+            print(f"Error listing files: {e}")
+            print(traceback.format_exc())
+            return f"Error listing files: {str(e)}"      
+
+    #Done
+    def show_file(self, filename):
+        """Display a specific file."""
+        try:
+            if (os.path.exists(filename)):
+                return st.image(Image.open(filename), caption=f"PNG: {filename}", width = 600)
+            else:
+                raise FileNotFoundError(f"Folder not found: {filename}")
+        except Exception as e:
+            print(f"Error displaying file: {e}")
+            print(traceback.format_exc())
+            return f"Error displaying file: {str(e)}"
+
+    #OPTIONAL for now
+    def show_projection_at_angle(self, target_angle):
+        """Display a projection at or near the specified angle."""
+        try:
+            if not self.projection_files:
+                return "No projection data available. Please run a tomography scan or take a measurement first."
+            
+            best_match = None
+            smallest_diff = float('inf')
+            
+            for file in self.projection_files:
+                # Extract angle from filename
+                try:
+                    angle_str = file.split('projection_')[1].split('deg_')[0]
+                    angle = float(angle_str)
+                    
+                    # Check if this is closer to the target angle
+                    diff = abs(angle - target_angle)
+                    if diff < smallest_diff:
+                        smallest_diff = diff
+                        best_match = file
+                except:
+                    continue
+            
+            if best_match:
+                # Store this as a displayed projection
+                self.displayed_files['projection'] = best_match
+                return f"DISPLAY_NPY|{best_match}"
+            else:
+                return f"Could not find a projection near {target_angle} degrees."
+        except Exception as e:
+            print(f"Error showing projection: {e}")
+            print(traceback.format_exc())
+            return f"Error showing projection: {str(e)}"
+    
+    #Working on right now
+    def show_last_projection(self):
+        path = '/home/user/tmpData/AI_scan/'
+        latest_time = 0
+        latest_folder = None
+        #Most recentely modified folder
+        for name in os.listdir(path):
+            full_path = os.path.join(path, name)
+            stat = os.stat(full_path)
+            mod_time = stat.st_mtime
+            #print(f"Folder:{name} Creation time: {time.ctime(mod_time)}")
+
+            if mod_time > latest_time:
+                latest_time = mod_time
+                latest_folder = name
+
+        if (latest_folder == "measurements"):
+            latest_folder = os.path.join(path, latest_folder)
+        else:
+            latest_folder = os.path.join(path, latest_folder, "raw_images/")
+
+        latest_file = None
+        latest_time = 0
+
+        for name in os.listdir(latest_folder):
+            full_path = os.path.join(latest_folder, name)
+            stat = os.stat(full_path)
+            mod_time = stat.st_ctime
+
+            if mod_time > latest_time:
+                latest_time = mod_time
+                latest_file = full_path
+            
+        return st.image(Image.open(latest_file.replace(".tiff", ".png")), caption=f"PNG: {latest_file}", width = 600)
+
+    #Done, with a popup window 
+    def show_reconstruction(self, reconstruction_folder):
+        """Display the reconstruction result."""
+        try:
+            path = "/home/user/tmpData/AI_scan/"
+            reconstruction_file = os.path.join(path, reconstruction_folder, "workspace", "dense", "scene_texture.ply")
+            if os.path.exists(reconstruction_file):
+                cmd = [env, "display_reconstruction.py", reconstruction_file]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    return f"Displaying reconstruction failed, highest quality mesh failed to be created during reconstruction:\n{result.stderr}"
+                
+                return "Object appeared on pop up window, please validate."
+
+                
+            else:
+                return f"Path provided does not exist: {reconstruction_file}"
+            
+        except Exception as e:
+            print(f"Error showing reconstruction: {e}")
+            print(traceback.format_exc())
+            return f"Error showing reconstruction: {str(e)}"
+
+    #Done (Can be modified to use streamlit)  (Can be done)
+    def list_available_folders(self):
+        """Ideally I'd like to potential data sets that I have, so folders with data and such."""
+        try:
+            path = "/home/user/tmpData/AI_scan/"
+            folders = os.listdir(path)
+            result = []
+            for i in range(len(folders)):
+                if (folders[i] != "measurements" and folders[i] != "testing"):
+                    dataset_info = self.get_dataset_info(folders[i])
+                    result.append(
+                        {"folder": folders[i],
+                         "files": dataset_info}
+                    )
+            return result
+        except Exception as e:
+            print(f"Error listing folders: {e}")
+            print(traceback.format_exc())
+            return f"Error listing folders: {str(e)}"      
+
+    #Done (API)
+    def move_rotation(self, angle):
+        """
+        Because it is based off of a different unit of measurement, fromw what is given
+        we only take a fraction of the movement in relation.
+        """
+        try:
+            ratio = 360 / 128               #Ratio between expected rotation and actual rotation amount of the motor
+            move_position = (angle /ratio)
+            cmd = ["caput", "DMC01:A", str(move_position)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return f"Motor move failed:\n{result.stderr}"
+            
+            if result.returncode == 0:
+                value_str = result.stdout.strip().split()[-1]
+                value = float(value_str)
+                degree = value * 2.8125
+            else:
+                print("Failed to get motor value:", result.stderr)
+
+            return degree  # will print: "Moved motor to X degrees"
+        except Exception as e:
+            return f"Error moving motor: {str(e)}"
+    
+    #Done (API)
+    def move_rotation_by(self, angle):
+        """
+            Because it is based off of a different unit of measurement, fromw what is given
+            we only take a fraction of the movement in relation.
+        """
+        try:
+            ratio = 360 / 128               #Ratio between expected rotation and actual rotation amount of the motor
+            move_amount = (angle / ratio)   #In relations to the provided angle, move amount correlates to the appropriate correct qunatity.
+            cmd = ["caget", "DMC01:A"]  
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                value_str = result.stdout.strip().split()[-1]
+                value = float(value_str)
+            else:
+                print("Failed to get motor value:", result.stderr)
+
+            cmd2 = ["caput", "DMC01:A", str(value + move_amount)]
+            result2 = subprocess.run(cmd2, capture_output=True, text=True)
+
+            if result2.returncode == 0:
+                value_str = result2.stdout.strip().split()[-1]
+                value = float(value_str)
+                degree = value * 2.8125
+            else:
+                print("Failed to get motor value:", result.stderr)
+
+            if result.returncode != 0:
+                return f"Motor move failed:\n{result.stderr}"
+            return degree  # will print: "Moved motor to X degrees"
+        except Exception as e:
+            return f"Error moving motor: {str(e)}"
+    
+    #Done, with an image being displayed (API, but no file sending just yet)
+    def take_measurement(self):
+        """Take a measurement with the detector."""
+        try:
+            """We are only using angle here for file saved name"""
+            ratio = float(360 / 128)
+
+            #Get motor angle for image output
+            cmd = ["caget", "DMC01:A"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                value_str = result.stdout.strip().split()[-1]
+                value = float(value_str)
+                angle = str(value * ratio)
+            else:
+                print("Failed to get motor value:", result.stderr)
+
+
+            #Take teh measurement
+            cmd2 = [env, "take_measurement.py", angle]
+            result2 = subprocess.run(cmd2, capture_output=True, text=True)
+
+            #From output of result2 take the file name, strip it, and store it
+            file_saved = result2.stdout.strip().split()[-1]
+            png_path = file_saved.replace(".tiff", ".png")
+            image_path = convert_image_format(file_saved, png_path)
+
+            crop_box = (800, 800, 1600, 1500)  # (left, upper, right, lower)
+            with Image.open(png_path) as img:
+                cropped = img.crop(crop_box)
+                cropped.save(png_path)  # Overwrite or change name if desired
+
+            st.image(Image.open(image_path), caption=f"PNG: {image_path}", width = 600)
+            os.remove(file_saved)
+
+
+            return f"Measurement taken at {angle} degrees"
+        except Exception as e:
+            print(f"Error taking measurement: {e}")
+            print(traceback.format_exc())
+            return f"Error taking measurement: {str(e)}"
+
+    #Done (might need adjustmenets but runs) (API, works)
+    def run_tomography_scan(self, start_angle, end_angle, num_projections, save_dir):
+        """Run a tomography scan."""
+        try:
+            start_angle = float(start_angle)
+            end_angle = float(end_angle)
+            num_projections = int(num_projections)
+            
+            print(f"Running tomography scan from {start_angle * 2.8125} to {end_angle * 2.8125} degrees with {num_projections} projections, saving to {save_dir}")
+
+            #Call to tomography scan function at main.py
+
+            cmd = [env, 'run_tomography_scan.py', str(start_angle), str(end_angle), str(num_projections), str(save_dir)]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return f"Motor move failed:\n{result.stderr}"
+            
+            result_message = {
+                f"Completed tomography scan with {num_projections} projections from {start_angle} to {end_angle} degrees"
+                f"Original images saved to '/home/user/tmpData/AI_scan/" + save_dir + "/uncropped_images/"
+                f"Cropped images saved to '/home/user/tmpData/AI_scan/" + save_dir + "/images/" 
+            }
+            return result_message
+        except Exception as e:
+            print(f"Error running tomography scan: {e}")
+            print(traceback.format_exc())
+            return f"Error running tomography scan: {str(e)}"
+
+    #Working, but remember it's without the use of cuda dependencies available in the other  (Can be done)
+    def reconstruct_data(self, folder):
+        """Reconstruct data from projections."""
+        try:
+            #Check if files exist from the scan
+            path = "/home/user/tmpData/AI_scan/" + folder
+            if os.path.isdir(path):
+                print(f"Folder exists, proceeding with reconstruction on data from {folder}")
+            else:
+                raise FileNotFoundError(f"Folder not found: {path}")
+
+            #Since folder exists, run reconstruction algorithm using the path
+            cmd = [env, "reconstruction.py", folder]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return f"Scan failed:\n{result.stderr}"
+            
+            return "Reconstruction complete. Results saved to " + path + "/workspace/"
+        except Exception as e:
+            print(f"Error reconstructing data: {e}")
+            print(traceback.format_exc())
+            return f"Error reconstructing data: {str(e)}"
+    
+    #Done (API)
+    def get_current_angle(self):
+        """Get the current rotation angle."""
+        try:
+            cmd = ["caget", "DMC01:A"]  
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                value_str = result.stdout.strip().split()[-1]
+                value = float(value_str)
+                value = value * 2.8125   #Ratio
+            else:
+                print("Failed to get motor value:", result.stderr)
+            return f"Current rotation angle: {value} degrees"
+        except Exception as e:
+            print(f"Error getting current angle: {e}")
+            return f"Error getting current angle: {str(e)}"
+    
+    """
+    You sohuld definetely design a full reconstruction from a scan, (run a scan from 0 to 180, save to bolt_scan and reconstruct data from it.)
+    """    
+    def close(self):
+        """Close all connections."""
+        try:
+            self.sample_stage.rotation.close()
+            self.detector.acquire.close()
+            self.detector.image.close()
+        except Exception as e:
+            print(f"Error closing connections: {e}")
+
+    """
+    You can definitely modify a lot of these outputs using st.write(), even though it doesnt necessarily do what AI generates
+    
+    """
