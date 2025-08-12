@@ -1,12 +1,30 @@
 from fastapi import FastAPI
 import os
 import subprocess
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+# Enable permissive CORS so a web UI from another origin can call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 env = "python"
 
 #Proper format
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
 @app.get("/move_motor_by/{amount}")
 def move_motor_by(amount: int):
@@ -47,6 +65,11 @@ def move_motor(amount: int):
         return f"Failed to move motor:\n{result.stderr}"
 
     return {"message": f"Moved motor to true amout of {amount}"}
+
+@app.get("/move_motor/{amount}/{extra}")
+def move_motor_with_extra(amount: int, extra: int):
+    # Compatibility route for clients calling /move_motor/<amount>/<extra>
+    return move_motor(amount)
 
 @app.get("/take_measurement")
 def acquire_image():
@@ -215,5 +238,11 @@ def reconstruction(file_name: str):
     except Exception as e:
             print(f"Error getting current angle: {e}")
             return f"Error getting current angle: {str(e)}"
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("API_WORKING.server:app", host="0.0.0.0", port=8000, reload=False)
 
 
